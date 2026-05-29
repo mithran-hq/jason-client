@@ -1,0 +1,372 @@
+use clap::{Args, Parser, Subcommand};
+use reqwest::blocking::Client;
+use reqwest::StatusCode;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::thread;
+use std::time::Duration;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[derive(Parser)]
+#[command(name = "jason", version, about = "Hosted Jason client for MAP")]
+struct Cli {
+    #[arg(long, global = true)]
+    login_state: Option<PathBuf>,
+
+    #[arg(long, global = true)]
+    controller_endpoint: Option<String>,
+
+    #[arg(long, global = true)]
+    controller_token: Option<String>,
+
+    #[arg(long, global = true)]
+    json: bool,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    Doctor,
+    Status,
+    Task(TaskCommand),
+    Watch(WatchArgs),
+    Session(SessionCommand),
+    Version,
+}
+
+#[derive(Args)]
+struct TaskCommand {
+    #[command(subcommand)]
+    command: TaskSubcommand,
+}
+
+#[derive(Subcommand)]
+enum TaskSubcommand {
+    Add(TaskAddArgs),
+    List,
+    Show(IdArgs),
+}
+
+#[derive(Args)]
+struct TaskAddArgs {
+    #[arg(long)]
+    repo: String,
+
+    #[arg(long)]
+    issue: Option<String>,
+
+    #[arg(long)]
+    prompt: Option<String>,
+
+    #[arg(long)]
+    evidence_ref: Option<String>,
+}
+
+#[derive(Args)]
+struct WatchArgs {
+    id: String,
+
+    #[arg(long, default_value_t = 5)]
+    interval_seconds: u64,
+
+    #[arg(long, default_value_t = 120)]
+    timeout_seconds: u64,
+}
+
+#[derive(Args)]
+struct SessionCommand {
+    #[command(subcommand)]
+    command: SessionSubcommand,
+}
+
+#[derive(Subcommand)]
+enum SessionSubcommand {
+    Fetch(IdArgs),
+}
+
+#[derive(Args)]
+struct IdArgs {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginState {
+    jason_controller_endpoint: Option<String>,
+    access_token: String,
+    expires_at: Option<String>,
+    audience: Option<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
+}
+
+fn main() {
+    let cli = Cli::parse();
+    if let Err(error) = run(cli) {
+        eprintln!("jason: {}", redact(&error));
+        std::process::exit(1);
+    }
+}
+
+fn run(cli: Cli) -> Result<(), String> {
+    match &cli.command {
+        Command::Doctor => {
+            let state = resolve_state(&cli);
+            let payload = match state {
+                Ok(state) => json!({
+                    "ok": true,
+                    "schema_version": "jason.doctor.v1",
+                    "controller_endpoint": state.endpoint,
+                    "has_token": true,
+                }),
+                Err(error) => json!({
+                    "ok": false,
+                    "schema_version": "jason.doctor.v1",
+                    "error": redact(&error),
+                }),
+            };
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+            } else if payload["ok"].as_bool() == Some(true) {
+                println!("Jason hosted client is configured");
+            } else {
+                println!("Jason hosted client is not configured; run `map login`");
+            }
+            Ok(())
+        }
+        Command::Status => get(&cli, "/v1/status"),
+        Command::Task(TaskCommand {
+            command: TaskSubcommand::Add(args),
+        }) => post(
+            &cli,
+            "/v1/tasks",
+            json!({
+                "repo": args.repo,
+                "issue": args.issue,
+                "prompt": args.prompt,
+                "evidence_ref": args.evidence_ref,
+            }),
+        ),
+        Command::Task(TaskCommand {
+            command: TaskSubcommand::List,
+        }) => get(&cli, "/v1/tasks"),
+        Command::Task(TaskCommand {
+            command: TaskSubcommand::Show(args),
+        }) => get(&cli, &format!("/v1/tasks/{}", args.id)),
+        Command::Watch(args) => watch(&cli, args),
+        Command::Session(SessionCommand {
+            command: SessionSubcommand::Fetch(args),
+        }) => get(&cli, &format!("/v1/sessions/{}", args.id)),
+        Command::Version => print_json_or_text(
+            cli.json,
+            json!({ "name": "jason-client", "binary": "jason", "version": VERSION }),
+            VERSION,
+        ),
+    }
+}
+
+struct ResolvedState {
+    endpoint: String,
+    token: String,
+}
+
+fn resolve_state(cli: &Cli) -> Result<ResolvedState, String> {
+    if let (Some(endpoint), Some(token)) = (&cli.controller_endpoint, &cli.controller_token) {
+        return Ok(ResolvedState {
+            endpoint: endpoint.clone(),
+            token: token.clone(),
+        });
+    }
+
+    let path = login_state_path(cli.login_state.as_ref())?;
+    let text = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "read login state {}: {error}; run `map login`",
+            path.display()
+        )
+    })?;
+    let state: LoginState = serde_json::from_str(&text)
+        .map_err(|error| format!("parse {}: {error}", path.display()))?;
+    if !audience_allowed(&state) {
+        return Err("login state is not authorized for jason-controller".to_string());
+    }
+    let endpoint = state
+        .jason_controller_endpoint
+        .ok_or_else(|| "login state has no jason_controller_endpoint".to_string())?;
+    if let Some(expires_at) = &state.expires_at {
+        if expires_at.trim().is_empty() {
+            return Err("login state has an empty expires_at".to_string());
+        }
+    }
+    Ok(ResolvedState {
+        endpoint,
+        token: state.access_token,
+    })
+}
+
+fn login_state_path(override_path: Option<&PathBuf>) -> Result<PathBuf, String> {
+    if let Some(path) = override_path {
+        return Ok(path.clone());
+    }
+    if let Ok(path) = env::var("JASON_LOGIN_STATE") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Ok(path) = env::var("MITHRAN_LOGIN_STATE") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Ok(path) = env::var("AEGIS_LOGIN_STATE") {
+        return Ok(PathBuf::from(path));
+    }
+    let config_home = env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| env::var("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .map_err(|_| "HOME or XDG_CONFIG_HOME is required".to_string())?;
+    let mithran = config_home.join("mithran").join("login.json");
+    if mithran.exists() {
+        return Ok(mithran);
+    }
+    Ok(config_home.join("aegis").join("login.json"))
+}
+
+fn audience_allowed(state: &LoginState) -> bool {
+    state.audience.as_deref() == Some("jason-controller")
+        || state.scopes.iter().any(|scope| scope == "jason:*")
+        || state.scopes.iter().any(|scope| scope == "jason:controller")
+        || state
+            .scopes
+            .iter()
+            .any(|scope| scope == "audience:jason-controller")
+}
+
+fn client(cli: &Cli) -> Result<(Client, ResolvedState), String> {
+    let state = resolve_state(cli)?;
+    let client = Client::builder()
+        .build()
+        .map_err(|error| format!("build HTTP client: {error}"))?;
+    Ok((client, state))
+}
+
+fn get(cli: &Cli, path: &str) -> Result<(), String> {
+    let (client, state) = client(cli)?;
+    let response = client
+        .get(format!("{}{}", state.endpoint.trim_end_matches('/'), path))
+        .bearer_auth(&state.token)
+        .send()
+        .map_err(|error| format!("Jason request failed: {error}"))?;
+    print_response(cli.json, response)
+}
+
+fn post(cli: &Cli, path: &str, body: Value) -> Result<(), String> {
+    let (client, state) = client(cli)?;
+    let response = client
+        .post(format!("{}{}", state.endpoint.trim_end_matches('/'), path))
+        .bearer_auth(&state.token)
+        .json(&body)
+        .send()
+        .map_err(|error| format!("Jason request failed: {error}"))?;
+    print_response(cli.json, response)
+}
+
+fn watch(cli: &Cli, args: &WatchArgs) -> Result<(), String> {
+    let mut elapsed = 0;
+    loop {
+        let (client, state) = client(cli)?;
+        let response = client
+            .get(format!(
+                "{}/v1/tasks/{}",
+                state.endpoint.trim_end_matches('/'),
+                args.id
+            ))
+            .bearer_auth(&state.token)
+            .send()
+            .map_err(|error| format!("Jason watch failed: {error}"))?;
+        let value: Value = response
+            .json()
+            .map_err(|error| format!("read Jason watch response: {error}"))?;
+        if cli.json {
+            println!("{}", serde_json::to_string(&value).unwrap());
+        } else {
+            println!("{}", value["status"].as_str().unwrap_or("unknown"));
+        }
+        if matches!(
+            value["status"].as_str(),
+            Some("succeeded" | "failed" | "cancelled")
+        ) {
+            return Ok(());
+        }
+        if elapsed >= args.timeout_seconds {
+            return Err("watch timed out".to_string());
+        }
+        thread::sleep(Duration::from_secs(args.interval_seconds));
+        elapsed += args.interval_seconds;
+    }
+}
+
+fn print_response(json_output: bool, response: reqwest::blocking::Response) -> Result<(), String> {
+    let status = response.status();
+    let text = response
+        .text()
+        .map_err(|error| format!("read Jason response: {error}"))?;
+    if status != StatusCode::OK && status != StatusCode::CREATED && status != StatusCode::ACCEPTED {
+        return Err(format!("Jason returned {status}: {}", redact(&text)));
+    }
+    if json_output {
+        println!("{text}");
+    } else {
+        println!("ok");
+    }
+    Ok(())
+}
+
+fn print_json_or_text(json_output: bool, payload: Value, text: &str) -> Result<(), String> {
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+    } else {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+fn redact(text: &str) -> String {
+    let mut redacted = text.to_string();
+    for marker in ["access_token", "Authorization", "Bearer"] {
+        if redacted.contains(marker) {
+            redacted = redacted.replace(marker, "[REDACTED]");
+        }
+    }
+    redacted
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audience_accepts_jason_scope() {
+        let state = LoginState {
+            jason_controller_endpoint: Some("https://jason.example".to_string()),
+            access_token: "secret".to_string(),
+            expires_at: None,
+            audience: Some("map-control".to_string()),
+            scopes: vec!["jason:controller".to_string()],
+        };
+        assert!(audience_allowed(&state));
+    }
+
+    #[test]
+    fn audience_rejects_unrelated_login() {
+        let state = LoginState {
+            jason_controller_endpoint: Some("https://jason.example".to_string()),
+            access_token: "secret".to_string(),
+            expires_at: None,
+            audience: Some("map-control".to_string()),
+            scopes: vec!["map:deploy".to_string()],
+        };
+        assert!(!audience_allowed(&state));
+    }
+}

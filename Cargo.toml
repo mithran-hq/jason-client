@@ -1,0 +1,17 @@
+[package]
+name = "jason-client"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Hosted Jason client for Aegis.app and MAP"
+repository = "https://github.com/mithran-hq/jason-client"
+
+[[bin]]
+name = "jason"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
