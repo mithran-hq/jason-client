@@ -7,7 +7,7 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -124,25 +124,16 @@ fn run(cli: Cli) -> Result<(), String> {
         }
         Command::Run(args) => {
             validate_run_args(args)?;
-            post(
-                &cli,
-                "/v1/runs",
-                json!({
-                    "repo": args.repo,
-                    "issue": args.issue,
-                    "prompt": args.prompt,
-                    "evidence_ref": args.evidence_ref,
-                }),
-            )
+            post(&cli, "/v1/task", task_submit_payload(args))
         }
         Command::Status(args) => match &args.run_id {
-            Some(run_id) => get(&cli, &format!("/v1/runs/{run_id}")),
+            Some(run_id) => get(&cli, &format!("/v1/task/{run_id}")),
             None => get(&cli, "/v1/status"),
         },
         Command::Watch(args) => watch(&cli, args),
-        Command::Logs(args) => get(&cli, &format!("/v1/runs/{}/logs", args.run_id)),
-        Command::Artifacts(args) => get(&cli, &format!("/v1/runs/{}/artifacts", args.run_id)),
-        Command::Cancel(args) => post(&cli, &format!("/v1/runs/{}/cancel", args.run_id), json!({})),
+        Command::Logs(args) => get(&cli, &format!("/v1/task/{}/logs", args.run_id)),
+        Command::Artifacts(args) => get(&cli, &format!("/v1/task/{}/artifacts", args.run_id)),
+        Command::Cancel(args) => post(&cli, &format!("/v1/task/{}/cancel", args.run_id), json!({})),
         Command::Version => print_json_or_text(
             cli.json,
             json!({ "name": "jason-client", "binary": "jason", "version": VERSION }),
@@ -156,6 +147,51 @@ fn validate_run_args(args: &RunArgs) -> Result<(), String> {
         return Err("run requires --issue or --prompt".to_string());
     }
     Ok(())
+}
+
+fn task_submit_payload(args: &RunArgs) -> Value {
+    let prompt_ref = args
+        .issue
+        .as_deref()
+        .map(|issue| issue_prompt_ref(&args.repo, issue))
+        .unwrap_or_else(|| format!("prompt://{}", safe_repo_segment(&args.repo)));
+    let evidence_refs = args
+        .evidence_ref
+        .as_ref()
+        .map(|value| vec![value.clone()])
+        .unwrap_or_default();
+    json!({
+        "prompt_ref": prompt_ref,
+        "prompt_text": args.prompt,
+        "capabilities": [],
+        "priority": 0,
+        "evidence_refs": evidence_refs,
+    })
+}
+
+fn issue_prompt_ref(repo: &str, issue: &str) -> String {
+    let trimmed = issue.trim();
+    if trimmed.starts_with("http://")
+        || trimmed.starts_with("https://")
+        || trimmed.starts_with("github://")
+        || trimmed.starts_with("issue://")
+        || trimmed.starts_with("opaque://")
+    {
+        return trimmed.to_string();
+    }
+    format!("github://{}/issues/{}", repo.trim(), trimmed)
+}
+
+fn safe_repo_segment(repo: &str) -> String {
+    repo.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 struct ResolvedState {
@@ -190,11 +226,25 @@ fn resolve_state(cli: &Cli) -> Result<ResolvedState, String> {
         if expires_at.trim().is_empty() {
             return Err("login state has an empty expires_at".to_string());
         }
+        if expires_at_is_expired(expires_at) {
+            return Err("login state is expired; run `map login`".to_string());
+        }
     }
     Ok(ResolvedState {
         endpoint,
         token: state.access_token,
     })
+}
+
+fn expires_at_is_expired(expires_at: &str) -> bool {
+    let Ok(epoch_seconds) = expires_at.trim().parse::<u64>() else {
+        return false;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    epoch_seconds <= now
 }
 
 fn login_state_path(override_path: Option<&PathBuf>) -> Result<PathBuf, String> {
@@ -266,7 +316,7 @@ fn watch(cli: &Cli, args: &WatchArgs) -> Result<(), String> {
         let (client, state) = client(cli)?;
         let response = client
             .get(format!(
-                "{}/v1/runs/{}",
+                "{}/v1/task/{}",
                 state.endpoint.trim_end_matches('/'),
                 args.run_id
             ))
@@ -279,12 +329,9 @@ fn watch(cli: &Cli, args: &WatchArgs) -> Result<(), String> {
         if cli.json {
             println!("{}", serde_json::to_string(&value).unwrap());
         } else {
-            println!("{}", value["status"].as_str().unwrap_or("unknown"));
+            println!("{}", task_state(&value).unwrap_or("unknown"));
         }
-        if matches!(
-            value["status"].as_str(),
-            Some("succeeded" | "failed" | "cancelled")
-        ) {
+        if task_is_terminal(&value) {
             return Ok(());
         }
         if elapsed >= args.timeout_seconds {
@@ -293,6 +340,21 @@ fn watch(cli: &Cli, args: &WatchArgs) -> Result<(), String> {
         thread::sleep(Duration::from_secs(args.interval_seconds));
         elapsed += args.interval_seconds;
     }
+}
+
+fn task_state(value: &Value) -> Option<&str> {
+    value
+        .pointer("/task/state")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("state").and_then(Value::as_str))
+        .or_else(|| value.get("status").and_then(Value::as_str))
+}
+
+fn task_is_terminal(value: &Value) -> bool {
+    matches!(
+        task_state(value),
+        Some("completed" | "failed" | "blocked" | "cancelled" | "declined" | "succeeded")
+    )
 }
 
 fn print_response(json_output: bool, response: reqwest::blocking::Response) -> Result<(), String> {
@@ -367,5 +429,44 @@ mod tests {
             evidence_ref: None,
         };
         assert!(validate_run_args(&args).is_err());
+    }
+
+    #[test]
+    fn issue_run_payload_uses_controller_task_contract() {
+        let args = RunArgs {
+            repo: "mithran-hq/demo".to_string(),
+            issue: Some("123".to_string()),
+            prompt: None,
+            evidence_ref: Some("evidence://demo/run".to_string()),
+        };
+        let payload = task_submit_payload(&args);
+        assert_eq!(payload["prompt_ref"], "github://mithran-hq/demo/issues/123");
+        assert_eq!(payload["evidence_refs"][0], "evidence://demo/run");
+    }
+
+    #[test]
+    fn prompt_run_payload_uses_opaque_prompt_ref() {
+        let args = RunArgs {
+            repo: "mithran-hq/demo".to_string(),
+            issue: None,
+            prompt: Some("check status".to_string()),
+            evidence_ref: None,
+        };
+        let payload = task_submit_payload(&args);
+        assert_eq!(payload["prompt_ref"], "prompt://mithran-hq/demo");
+        assert_eq!(payload["prompt_text"], "check status");
+    }
+
+    #[test]
+    fn expired_numeric_login_state_is_rejected() {
+        assert!(expires_at_is_expired("1"));
+        assert!(!expires_at_is_expired("4102444800"));
+        assert!(!expires_at_is_expired("2026-05-29T00:00:00Z"));
+    }
+
+    #[test]
+    fn task_terminal_state_uses_controller_task_state() {
+        assert!(task_is_terminal(&json!({"task": {"state": "completed"}})));
+        assert!(!task_is_terminal(&json!({"task": {"state": "running"}})));
     }
 }
