@@ -25,6 +25,8 @@ jason logs run_123
 jason artifacts run_123
 ```
 
+The run id is the hosted controller task id returned by `jason run`.
+
 ## Commands
 
 The public client uses one user-facing concept: a run.
@@ -43,6 +45,22 @@ jason version
 
 `status` without a run id reports hosted controller status. `status <run-id>`
 reports one run.
+
+## Verification
+
+Normal CI runs the public client tests:
+
+```sh
+cargo test
+```
+
+When the private controller checkout is available as `../jason`, this smoke
+starts a real local `jason-controller` process and drives the public client
+against it:
+
+```sh
+scripts/smoke_spawned_controller.sh
+```
 
 ## Boundary
 
