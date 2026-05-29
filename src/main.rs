@@ -33,28 +33,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Doctor,
-    Status,
-    Task(TaskCommand),
+    Run(RunArgs),
+    Status(StatusArgs),
     Watch(WatchArgs),
-    Session(SessionCommand),
+    Logs(IdArgs),
+    Artifacts(IdArgs),
+    Cancel(IdArgs),
     Version,
 }
 
 #[derive(Args)]
-struct TaskCommand {
-    #[command(subcommand)]
-    command: TaskSubcommand,
-}
-
-#[derive(Subcommand)]
-enum TaskSubcommand {
-    Add(TaskAddArgs),
-    List,
-    Show(IdArgs),
-}
-
-#[derive(Args)]
-struct TaskAddArgs {
+struct RunArgs {
     #[arg(long)]
     repo: String,
 
@@ -69,8 +58,13 @@ struct TaskAddArgs {
 }
 
 #[derive(Args)]
+struct StatusArgs {
+    run_id: Option<String>,
+}
+
+#[derive(Args)]
 struct WatchArgs {
-    id: String,
+    run_id: String,
 
     #[arg(long, default_value_t = 5)]
     interval_seconds: u64,
@@ -80,19 +74,8 @@ struct WatchArgs {
 }
 
 #[derive(Args)]
-struct SessionCommand {
-    #[command(subcommand)]
-    command: SessionSubcommand,
-}
-
-#[derive(Subcommand)]
-enum SessionSubcommand {
-    Fetch(IdArgs),
-}
-
-#[derive(Args)]
 struct IdArgs {
-    id: String,
+    run_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,35 +122,40 @@ fn run(cli: Cli) -> Result<(), String> {
             }
             Ok(())
         }
-        Command::Status => get(&cli, "/v1/status"),
-        Command::Task(TaskCommand {
-            command: TaskSubcommand::Add(args),
-        }) => post(
-            &cli,
-            "/v1/tasks",
-            json!({
-                "repo": args.repo,
-                "issue": args.issue,
-                "prompt": args.prompt,
-                "evidence_ref": args.evidence_ref,
-            }),
-        ),
-        Command::Task(TaskCommand {
-            command: TaskSubcommand::List,
-        }) => get(&cli, "/v1/tasks"),
-        Command::Task(TaskCommand {
-            command: TaskSubcommand::Show(args),
-        }) => get(&cli, &format!("/v1/tasks/{}", args.id)),
+        Command::Run(args) => {
+            validate_run_args(args)?;
+            post(
+                &cli,
+                "/v1/runs",
+                json!({
+                    "repo": args.repo,
+                    "issue": args.issue,
+                    "prompt": args.prompt,
+                    "evidence_ref": args.evidence_ref,
+                }),
+            )
+        }
+        Command::Status(args) => match &args.run_id {
+            Some(run_id) => get(&cli, &format!("/v1/runs/{run_id}")),
+            None => get(&cli, "/v1/status"),
+        },
         Command::Watch(args) => watch(&cli, args),
-        Command::Session(SessionCommand {
-            command: SessionSubcommand::Fetch(args),
-        }) => get(&cli, &format!("/v1/sessions/{}", args.id)),
+        Command::Logs(args) => get(&cli, &format!("/v1/runs/{}/logs", args.run_id)),
+        Command::Artifacts(args) => get(&cli, &format!("/v1/runs/{}/artifacts", args.run_id)),
+        Command::Cancel(args) => post(&cli, &format!("/v1/runs/{}/cancel", args.run_id), json!({})),
         Command::Version => print_json_or_text(
             cli.json,
             json!({ "name": "jason-client", "binary": "jason", "version": VERSION }),
             VERSION,
         ),
     }
+}
+
+fn validate_run_args(args: &RunArgs) -> Result<(), String> {
+    if args.issue.is_none() && args.prompt.is_none() {
+        return Err("run requires --issue or --prompt".to_string());
+    }
+    Ok(())
 }
 
 struct ResolvedState {
@@ -278,9 +266,9 @@ fn watch(cli: &Cli, args: &WatchArgs) -> Result<(), String> {
         let (client, state) = client(cli)?;
         let response = client
             .get(format!(
-                "{}/v1/tasks/{}",
+                "{}/v1/runs/{}",
                 state.endpoint.trim_end_matches('/'),
-                args.id
+                args.run_id
             ))
             .bearer_auth(&state.token)
             .send()
@@ -368,5 +356,16 @@ mod tests {
             scopes: vec!["map:deploy".to_string()],
         };
         assert!(!audience_allowed(&state));
+    }
+
+    #[test]
+    fn run_requires_issue_or_prompt() {
+        let args = RunArgs {
+            repo: "mithran-hq/demo".to_string(),
+            issue: None,
+            prompt: None,
+            evidence_ref: None,
+        };
+        assert!(validate_run_args(&args).is_err());
     }
 }

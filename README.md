@@ -19,8 +19,30 @@ map login save \
 
 jason doctor
 jason status
-jason task list
+jason run --repo mithran-hq/demo --issue 123
+jason watch run_123
+jason logs run_123
+jason artifacts run_123
 ```
+
+## Commands
+
+The public client uses one user-facing concept: a run.
+
+```text
+jason run --repo <owner/repo> --issue <number-or-url>
+jason run --repo <owner/repo> --prompt <text>
+jason status [run-id]
+jason watch <run-id>
+jason logs <run-id>
+jason artifacts <run-id>
+jason cancel <run-id>
+jason doctor
+jason version
+```
+
+`status` without a run id reports hosted controller status. `status <run-id>`
+reports one run.
 
 ## Boundary
 
@@ -28,7 +50,7 @@ Public:
 
 - hosted controller client;
 - login-state discovery;
-- task/session/status inspection.
+- run/status/log/artifact inspection.
 
 Private:
 
