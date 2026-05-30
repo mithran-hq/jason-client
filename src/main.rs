@@ -389,6 +389,12 @@ fn redact(text: &str) -> String {
             redacted = redacted.replace(marker, "[REDACTED]");
         }
     }
+    if let Ok(home) = env::var("HOME") {
+        let home = home.trim_end_matches('/');
+        if !home.is_empty() && redacted.contains(home) {
+            redacted = redacted.replace(home, "[HOME]");
+        }
+    }
     redacted
 }
 
@@ -429,6 +435,16 @@ mod tests {
             evidence_ref: None,
         };
         assert!(validate_run_args(&args).is_err());
+    }
+
+    #[test]
+    fn redaction_removes_local_home_paths() {
+        let home = env::var("HOME").expect("HOME should be set in tests");
+        let text = format!("read login state {home}/.config/aegis/login.json");
+        let redacted = redact(&text);
+
+        assert!(!redacted.contains(&home));
+        assert!(redacted.contains("[HOME]/.config/aegis/login.json"));
     }
 
     #[test]
