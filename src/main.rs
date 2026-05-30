@@ -179,7 +179,7 @@ fn issue_prompt_ref(repo: &str, issue: &str) -> String {
     {
         return trimmed.to_string();
     }
-    format!("github://{}/issues/{}", repo.trim(), trimmed)
+    format!("issue://{}/{}", repo.trim(), trimmed)
 }
 
 fn safe_repo_segment(repo: &str) -> String {
@@ -456,7 +456,7 @@ mod tests {
             evidence_ref: Some("evidence://demo/run".to_string()),
         };
         let payload = task_submit_payload(&args);
-        assert_eq!(payload["prompt_ref"], "github://mithran-hq/demo/issues/123");
+        assert_eq!(payload["prompt_ref"], "issue://mithran-hq/demo/123");
         assert_eq!(payload["evidence_refs"][0], "evidence://demo/run");
     }
 
