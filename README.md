@@ -12,8 +12,8 @@ remain private MAP infrastructure.
 
 ```sh
 map login save \
-  --map-control-endpoint https://map.example.com \
-  --jason-controller-endpoint https://jason.example.com \
+  --map-control-endpoint https://control-plane.example.com \
+  --jason-controller-endpoint https://control-plane.example.com \
   --access-token "$MITHRAN_TOKEN" \
   --scope audience:jason-controller
 
@@ -26,6 +26,11 @@ jason artifacts run_123
 ```
 
 The run id is the hosted controller task id returned by `jason run`.
+
+`--map-control-endpoint` names the MAP protocol endpoint. In MAP 1.0 that
+endpoint is served by `mithran-control-plane`; `mithran-map-control` is retired.
+`--jason-controller-endpoint` may point at the control-plane Jason-facing
+gateway rather than a direct private controller URL.
 
 ## Commands
 
